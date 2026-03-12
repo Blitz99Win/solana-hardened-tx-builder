@@ -207,8 +207,8 @@ for (const tx of result.transactions) {
 }
 ```
 
-> **Why `sendTransaction` over `signTransaction` + `sendRawTransaction`?**  
-> Using the wallet adapter's `sendTransaction` allows Blowfish Lighthouse and Phantom's native simulation engine to inspect the transaction before the user signs. Our security checks happen during *construction* (before this call), not during signing — so you get both layers of protection.
+> **Why `signTransaction` + `sendRawTransaction` with `skipPreflight: false`?**  
+> Using `signTransaction` + `sendRawTransaction(skipPreflight: false)` allows Blowfish Lighthouse and Phantom's native simulation engine to inspect the transaction before the user signs. Our security checks happen during *construction* (before this call), not during signing — so you get both layers of protection.
 
 ---
 
