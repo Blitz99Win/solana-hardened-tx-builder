@@ -213,7 +213,7 @@ const ALLOWED_RPC_HOSTS = Object.freeze([
 ## Links
 
 - **Production:** [solaudit.app](https://solaudit.app)
-- **Twitter:** [@solaboratorio](https://twitter.com/solaboratorio)
+- **Twitter:** [@SolauditApp](https://x.com/SolauditApp)
 - **Developer:** Jose ([@Blitz99Win](https://github.com/Blitz99Win))
 
 ---
