@@ -1,17 +1,18 @@
-# SolAudit — Secure Transaction Core 🛡️
+# SolAudit — Secure Transaction Core
+
 > Open-source security module powering [solaudit.app](https://solaudit.app)
 
-This module is the core transaction engine used in production at solaudit.app — a Solana wallet security tool for revoking token approvals, recovering SOL rent, and burning unwanted tokens.
+This repository contains the security-hardened transaction builder used in production at SolAudit — a Solana wallet security scanner for revoking token approvals, recovering SOL rent, burning unwanted tokens, and batch-selling via Jupiter Ultra.
 
-This repository contains an open-source, heavily security-hardened transaction builder for Solana dApps. It is a sanitizer and transaction-packing engine designed for handling batch token account operations safely.
+This is a sanitized version of our production code. It demonstrates our security practices transparently — any engineer can verify in minutes that funds always go to the user's wallet.
 
 ---
 
-## Why this exists
+## Why This Exists
 
-Most Solana dApps build and sign transactions without verifying what they're actually signing at the instruction level. This leaves users exposed to:
+Most Solana dApps build transactions without verifying what they contain at the instruction level. This leaves users exposed to:
 
-- **Supply chain attacks** on npm packages (verified real incident: CVE-2024-54134, $190K stolen)
+- **Supply chain attacks** on npm packages (real incident: CVE-2024-54134, $190K stolen)
 - **Malicious RPC responses** that inflate balances or redirect destinations
 - **Prototype pollution** that silently replaces critical wallet addresses
 - **XSS injection** into token/NFT metadata that hijacks transfers
@@ -20,41 +21,50 @@ This module addresses all of the above with layered, zero-trust defenses.
 
 ---
 
-## Wallet Provider Compatibility
+## Wallet Signing Methods
 
-### ✅ Phantom / Blowfish Lighthouse Compatible
+SolAudit uses different signing methods depending on the operation, all compatible with Blowfish Lighthouse simulation:
 
-SolAudit uses **`sendTransaction`** (the wallet adapter's method) as the exclusive signing path. This is required for Phantom's Blowfish Lighthouse safety guards to inspect and simulate transactions before user approval.
+### Signing Method Matrix
 
-**Why this matters:**
-- `signTransaction` + `sendRawTransaction` bypasses Lighthouse — transactions are signed *before* simulation
-- `sendTransaction` sends the **unsigned** transaction to the wallet, which can simulate it and display safety warnings
+| Operation | Method | Blowfish Compatible | Why |
+|---|---|---|---|
+| Revoke, Close, Burn (single tx) | `wallet.sendTransaction()` | Yes | Maps to provider `signAndSendTransaction` — Blowfish intercepts and simulates |
+| Batch burns, Rent recovery | `wallet.sendTransaction()` per tx | Yes | One popup per batch transaction |
+| Panic Sell — batch (primary) | `wallet.signAllTransactions()` | Yes | 1 popup for all swaps — Blowfish simulates each tx individually in batch popup |
+| Panic Sell — sequential (fallback) | `wallet.signTransaction()` | Yes | 1 popup per swap — signed tx sent to Jupiter Ultra execute |
+| Panic Sell — last resort | `wallet.sendTransaction()` | Yes | For wallets without `signTransaction` support |
 
-**Our architecture:**
-1. Transactions are built server-side via Edge Routes (Cloudflare Workers / Vercel Edge Functions)
-2. The server returns **unsigned** `VersionedTransaction` with sufficient free space for Lighthouse guard instructions
-3. The client calls `wallet.sendTransaction(tx, connection)` — **never** `signTransaction`
-4. Phantom/Blowfish inspects the transaction → user approves → wallet signs and sends atomically
+### How Blowfish Works With Each Method
 
-```typescript
-// ✅ CORRECT — Lighthouse compatible
-const { sendTransaction } = useWallet();
-const sig = await sendTransaction(tx, connection, {
-  skipPreflight: false,
-  maxRetries: 3,
-});
+**`sendTransaction`** — Blowfish intercepts at the wallet provider level. The wallet adapter's `sendTransaction()` maps to the provider's `signAndSendTransaction`, which Blowfish hooks into to simulate before the user approves.
 
-// ❌ WRONG — bypasses Lighthouse
-const signed = await signTransaction(tx);
-const sig = await connection.sendRawTransaction(signed.serialize());
+**`signAllTransactions`** — Blowfish simulates each transaction individually within the batch approval popup. The user sees a summary of all transactions before approving. Used by DZap, Raydium, Orca, and other major dApps for batch operations.
+
+**`signTransaction`** — Blowfish intercepts during the sign step. The transaction is simulated before the user approves signing. After signing, the transaction cannot be modified (ed25519 signature covers every byte).
+
+### Architecture
+
+```
+Server (Edge/Worker)                    Client (Browser)
+┌──────────────────┐                    ┌──────────────────────┐
+│ Build unsigned tx │ ──── base64 ────> │ Deserialize          │
+│ (VersionedTx)    │                    │ Blowfish simulates   │
+│ No private keys  │                    │ User approves popup  │
+│ No signing       │                    │ Wallet signs         │
+└──────────────────┘                    │ Send to network      │
+                                        └──────────────────────┘
 ```
 
-### Supported wallets
+For Panic Sell (Jupiter Ultra), the signed transaction is sent back to our server which forwards it to Jupiter's `/ultra/v1/execute` endpoint for optimal landing. The signed transaction is never modified — any modification would invalidate the ed25519 signature.
+
+### Supported Wallets
+
 - Phantom (with Blowfish Lighthouse)
 - Solflare
 - Backpack
 - Ledger (via adapter)
-- Any wallet supporting `@solana/wallet-adapter`
+- Any wallet supporting `@solana/wallet-adapter-react`
 
 ---
 
@@ -63,14 +73,14 @@ const sig = await connection.sendRawTransaction(signed.serialize());
 ### Transaction-Level Defenses
 
 #### [CRITICAL-1] Supply Chain Attack — CVE-2024-54134 (CVSS 8.3)
-**Real incident:** `@solana/web3.js` v1.95.7 was backdoored on Dec 2, 2024 via spear-phishing of a developer with npm publish access. The backdoor added the `addToQueue` function that exfiltrated private keys via fake CloudFlare headers to `sol-rpc[.]xyz`.
+**Real incident:** `@solana/web3.js` v1.95.7 was backdoored on Dec 2, 2024. The backdoor exfiltrated private keys via fake CloudFlare headers.
 
-**Fix:** After `createCloseAccountInstruction()` is called, we deserialize the resulting instruction and verify byte-by-byte that:
+**Fix:** After `createCloseAccountInstruction()` is called, we deserialize and verify byte-by-byte that:
 - `keys[0]` (account to close) matches the expected token account
 - `keys[1]` (destination) matches the user's wallet — **the most critical check**
 - `keys[2]` (authority) matches the user's wallet
 
-If any check fails, the entire operation aborts immediately before signing.
+If any check fails, the entire operation aborts before signing.
 
 ```typescript
 function verifyCloseInstruction(
@@ -80,135 +90,80 @@ function verifyCloseInstruction(
   expectedAuthority: PublicKey
 ): boolean {
   if (ix.keys.length < 3) return false;
-  const destination = ix.keys[1].pubkey;
-  if (!destination.equals(expectedDestination)) return false; // abort if tampered
-  // ...
+  if (!ix.keys[1].pubkey.equals(expectedDestination)) return false;
+  // ...full verification of all 3 keys
 }
 ```
 
 #### [CRITICAL-2] Malicious RPC / MITM
-A Service Worker, malicious browser extension, or compromised network can substitute the RPC endpoint silently. A fake RPC can return inflated balances, redirect destinations, or provide expired blockhashes.
+A Service Worker or browser extension can replace the RPC endpoint silently.
 
-**Fix:** The Connection object's endpoint is validated against a trusted whitelist using `URL` parsing with suffix-based subdomain matching before any RPC call is made.
+**Fix:** The Connection object's endpoint is validated against a trusted whitelist using URL parsing with suffix-based subdomain matching.
 
 #### [CRITICAL-3] Prototype Pollution
-Attackers that compromise Node.js/npm can set `Object.prototype.toPubkey = attackerWallet`, corrupting address resolution across the entire application.
+`Object.prototype.toPubkey = attackerWallet` can corrupt address resolution.
 
-**Fix:** 
-- `Object.freeze()` on all constant arrays and PublicKey objects
-- `instanceof PublicKey` for all type checks (duck typing bypasses this protection)
+**Fix:** `Object.freeze()` on all constant arrays and PublicKey objects. `instanceof PublicKey` for type checks.
 
-#### [CRITICAL-4] XSS → Wallet Drain
-If an NFT metadata field or token name contains `<script>` tags and XSS is present, an attacker can replace in-memory fee wallet addresses at runtime.
+#### [CRITICAL-4] XSS to Wallet Drain
+XSS in token metadata can replace fee wallet addresses at runtime.
 
-**Fix:** All critical constants are frozen with `Object.freeze()`. Fee wallet address is resolved from a backend environment variable, not embedded in client-side code.
+**Fix:** All critical constants are frozen. Fee wallet resolved from backend environment variable, never embedded in client code.
 
 #### [HIGH-5] Account Spoofing
-A malicious RPC can inject accounts with inflated lamport values or inject pubkeys belonging to other users.
+Malicious RPC can inject accounts with inflated lamport values.
 
-**Fix:** Every account undergoes on-chain verification before being added to any transaction:
+**Fix:** On-chain verification before every transaction:
 1. Account must exist on-chain
 2. Owner must be `TOKEN_PROGRAM_ID` or `TOKEN_2022_PROGRAM_ID`
-3. Authority (token account owner) must be `===` `userPubkey`
-4. On-chain lamports must not deviate more than 2% from reported value
-5. Lamports capped at `5_000_000` — any higher triggers rejection as suspicious
+3. Authority must match `userPubkey`
+4. Lamports must not deviate more than 2% from reported value
+5. Lamports capped at 5,000,000 — higher triggers rejection
 
-#### [HIGH-6] Integer Overflow / Precision Loss
-JavaScript's `Number.MAX_SAFE_INTEGER = 2^53 - 1`. Lamport values for wallets with many accounts can exceed this, causing fee calculation errors.
+#### [HIGH-6] Integer Overflow / Precision
+JavaScript `Number.MAX_SAFE_INTEGER = 2^53-1`. Lamport totals can exceed this.
 
-**Fix:** Exclusive use of `BigInt` for all financial calculations. The protocol fee is calculated as:
-
+**Fix:** Exclusive use of `BigInt` for all financial calculations:
 ```typescript
 const PROTOCOL_FEE_BPS = 400n;    // 4%
 const BPS_DIVISOR      = 10_000n;
-
-const feeLamports = (batchRent * PROTOCOL_FEE_BPS) / BPS_DIVISOR; // pure BigInt
+const feeLamports = (batchRent * PROTOCOL_FEE_BPS) / BPS_DIVISOR;
 ```
 
 #### [MEDIUM-7] Dynamic Compute Unit Calibration
-Using hardcoded CU limits wastes fees or causes transaction failures.
+Hardcoded CU limits waste fees or cause failures.
 
-**Fix:** We simulate a representative transaction on-chain (`calibrateCuPerClose`) to measure actual CUs consumed, then apply a `1.25x` safety buffer. Batch sizes auto-shrink if the serialized transaction exceeds 1,180 bytes.
+**Fix:** Simulate a representative transaction to measure actual CUs, apply 1.25x safety buffer. Batch sizes auto-shrink if serialized tx exceeds 1,180 bytes.
 
 ### API-Level Defenses
 
-#### [SEC-1] ed25519 Curve Validation
-All incoming wallet addresses are validated with `PublicKey.isOnCurve()`. Off-curve addresses (PDAs, invalid pubkeys) are rejected before any RPC call is made. This prevents abuse with program-derived addresses that cannot sign transactions.
-
-#### [SEC-2] Content-Type Enforcement
-API endpoints strictly validate `Content-Type: application/json`. Requests with missing or incorrect content types receive `415 Unsupported Media Type`.
-
-#### [SEC-3] Rate Limiting with Security Headers
-Per-IP rate limiting with configurable windows per endpoint. All responses include:
-- `X-RateLimit-Limit` / `X-RateLimit-Remaining` / `X-RateLimit-Reset`
-- `X-Content-Type-Options: nosniff`
-- `X-Frame-Options: DENY`
-- `Referrer-Policy: strict-origin-when-cross-origin`
-
-#### [SEC-4] CSRF / Origin Validation
-POST requests to API endpoints validate the `Origin` header against a whitelist of allowed origins. Unknown origins receive `403 Forbidden`. This prevents cross-site request forgery.
-
-#### [SEC-5] Account Cap
-Maximum 200 token accounts per single request. This prevents resource exhaustion and ensures transaction batches stay within Solana's limits.
-
-#### [SEC-6] Structured Security Logging
-In production, security events (rate limits, origin violations, validation failures) are logged as structured JSON without stack traces. This prevents leaking sensitive information (RPC API keys, internal paths) while maintaining full observability.
+| Defense | Description |
+|---|---|
+| **ed25519 Curve Validation** | All wallet addresses validated with `PublicKey.isOnCurve()` at every entry point |
+| **Content-Type Enforcement** | Strict `application/json` validation, `415` on mismatch |
+| **Rate Limiting** | Per-IP fixed-window rate limiting per endpoint |
+| **CSRF / Origin Validation** | `Origin` header validated against whitelist, `403` on unknown origins |
+| **Account Cap** | Maximum 200 token accounts per request (DoS prevention) |
+| **Structured Logging** | JSON-logged security events without stack traces (prevents API key leakage) |
+| **Blockhash Freshness** | Auto-refresh if batch build exceeds 2 seconds |
+| **Pre-flight Simulation** | Every transaction simulated with `sigVerify: false` before returning to client |
 
 ---
 
-## Integration Guide
+## Transaction Integrity Guarantee
 
-### 1. Install dependencies
+Once a user signs a transaction, **nobody can modify it** — not SolAudit, not Jupiter, not anyone. This is guaranteed by ed25519 cryptography:
 
-```bash
-npm install @solana/web3.js @solana/spl-token
-```
+1. The wallet signs the transaction bytes with the user's private key
+2. The signature covers **every byte** of the transaction (instructions, accounts, amounts)
+3. Any modification (even 1 bit) invalidates the signature
+4. Validators reject transactions with invalid signatures
 
-### 2. Pass feeWallet from your backend
-
-```typescript
-// In your Edge Route / Worker (server-side)
-const feeWallet = new PublicKey(process.env.FEE_WALLET!);
-```
-
-Never embed your fee wallet address in client-side code.
-
-### 3. Build the transactions
-
-```typescript
-import { buildSecureTransaction } from "./buildSecureTransaction";
-
-const result = await buildSecureTransaction(connection, userPubkey, accounts, {
-  feeWallet,           // from backend
-  connectedWallet,     // from useWallet()
-  useJito: true,
-  jitoTipLamports: 10_000n,
-});
-
-if (!result.ok) {
-  console.error(result.code, result.message);
-  return;
-}
-
-// result.transactions → VersionedTransaction[] ready to sign & send
-```
-
-### 4. Send via wallet adapter (Blowfish/Lighthouse compatible)
-
-```typescript
-const { sendTransaction } = useWallet();
-
-for (const tx of result.transactions) {
-  const sig = await sendTransaction(tx, connection, {
-    skipPreflight: false,
-    maxRetries: 3,
-  });
-  await connection.confirmTransaction(sig, "confirmed");
-}
-```
-
-> **Why `signTransaction` + `sendRawTransaction` with `skipPreflight: false`?**  
-> Using `signTransaction` + `sendRawTransaction(skipPreflight: false)` allows Blowfish Lighthouse and Phantom's native simulation engine to inspect the transaction before the user signs. Our security checks happen during *construction* (before this call), not during signing — so you get both layers of protection.
+**What this means in practice:**
+- The server builds an unsigned transaction and sends it to the client
+- Blowfish/Phantom shows the user exactly what will happen (simulation)
+- The user approves and signs
+- After signing, the transaction is immutable — it will do exactly what was simulated
 
 ---
 
@@ -216,59 +171,53 @@ for (const tx of result.transactions) {
 
 | Code | Meaning |
 |---|---|
-| `WALLET_MISMATCH` | Connected wallet ≠ userPubkey. Possible parameter tampering. |
-| `RPC_UNTRUSTED` | RPC endpoint not in the trusted whitelist. |
-| `NO_ACCOUNTS` | No valid accounts after input sanitization. |
-| `ACCOUNT_VALIDATION_FAILED` | All accounts failed on-chain anti-spoofing validation. |
-| `SUPPLY_CHAIN_ALERT` | **Critical:** A generated instruction had a tampered destination. Nothing was signed. |
-| `TX_TOO_LARGE` | Transaction exceeds 1,180B safe limit even at batch size 1. |
-| `BLOCKHASH_EXPIRED` | Detected via `lastValidBlockHeight` comparison at signing time. |
+| `WALLET_MISMATCH` | Connected wallet does not match userPubkey |
+| `RPC_UNTRUSTED` | RPC endpoint not in trusted whitelist |
+| `NO_ACCOUNTS` | No valid accounts after sanitization |
+| `ACCOUNT_VALIDATION_FAILED` | All accounts failed on-chain verification |
+| `SUPPLY_CHAIN_ALERT` | **Critical:** Instruction had tampered destination. Nothing was signed. |
+| `TX_TOO_LARGE` | Transaction exceeds 1,180B safe limit |
+| `BLOCKHASH_EXPIRED` | Blockhash expired before signing |
 
 ---
 
 ## Trusted RPC Whitelist
 
 ```typescript
-const ALLOWED_RPC_HOSTS = [
+const ALLOWED_RPC_HOSTS = Object.freeze([
   "api.mainnet-beta.solana.com",
-  "helius-rpc.com",        // covers mainnet.helius-rpc.com, staked.helius-rpc.com
-  "helius.xyz",            // covers rpc.helius.xyz
+  "helius-rpc.com",
+  "helius.xyz",
   "rpc.ankr.com",
-  "g.alchemy.com",         // covers solana-mainnet.g.alchemy.com
+  "g.alchemy.com",
   "mainnet.rpc.jito.wtf",
   "api.devnet.solana.com",
   "127.0.0.1", "localhost",
-];
+]);
 ```
-
-To add a custom RPC, extend this array. Any endpoint not in the list is rejected before execution.
 
 ---
 
 ## Design Principles
 
-- **Zero-trust inputs**: Every parameter is validated independently, regardless of origin.
-- **Zero-trust libraries**: We verify the output of `createCloseAccountInstruction()` at the instruction level, not at the library API level.
-- **Fail-closed**: Any validation failure returns a typed error and aborts — nothing is signed.
-- **Immutability by default**: Every critical constant is frozen at module load time.
-- **BigInt everywhere**: All financial calculations use BigInt to avoid precision loss.
-- **`sendTransaction` only**: All transaction signing flows use the wallet adapter's `sendTransaction` method, enabling Phantom Blowfish Lighthouse and other wallet-level simulation guards.
-- **Structured logging**: Security events are JSON-logged in production without stack traces to prevent information leakage.
-
-> *True security does not come from obscurity. It comes from verifiable, auditable code that can withstand public scrutiny.*
+- **Zero-trust inputs** — every parameter validated independently
+- **Zero-trust libraries** — instruction output verified at byte level, not API level
+- **Fail-closed** — any validation failure returns typed error and aborts
+- **Immutability by default** — all constants frozen at module load
+- **BigInt everywhere** — no floating point in financial calculations
+- **Structured logging** — JSON events without stack traces in production
+- **Blowfish compatible** — all signing paths allow wallet-level simulation before user approval
 
 ---
 
 ## Links
 
-- **Production app:** [solaudit.app](https://solaudit.app)
-- **GitHub (this repo):** [Blitz99Win/solana-hardened-tx-builder](https://github.com/Blitz99Win/solana-hardened-tx-builder)
-- **Developer:** [@Blitz99Win](https://github.com/Blitz99Win)
+- **Production:** [solaudit.app](https://solaudit.app)
+- **Twitter:** [@solaboratorio](https://twitter.com/solaboratorio)
+- **Developer:** Jose ([@Blitz99Win](https://github.com/Blitz99Win))
 
 ---
 
 ## License
 
-MIT — use freely, attribution appreciated.
-
-Built with ❤️ by the [SolAudit](https://solaudit.app) team.
+MIT

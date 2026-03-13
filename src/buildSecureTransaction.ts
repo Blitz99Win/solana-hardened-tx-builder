@@ -2,8 +2,16 @@
  * buildSecureTransaction.ts
  * ============================================================
  * SolAudit — Secure Transaction Core
- * Versión: 4.0.0 — HARDENED SECURITY · 2026
+ * Version: 4.1.0 — HARDENED SECURITY · March 2026
  * ============================================================
+ *
+ * This is a sanitized version of the production transaction builder
+ * used at solaudit.app. It handles batch token account close operations
+ * (rent recovery) with extensive security hardening.
+ *
+ * NOTE: This file builds UNSIGNED transactions only. The client
+ * receives these and signs via the wallet adapter. Blowfish/Phantom
+ * simulate each transaction before the user approves.
  *
  * ════════════════════════════════════════════════════════════
  * SECURITY AUDIT — VULNERABILITIES FOUND & FIXED
