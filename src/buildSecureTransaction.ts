@@ -2,7 +2,7 @@
  * buildSecureTransaction.ts
  * ============================================================
  * SolAudit — Secure Transaction Core
- * Version: 4.1.0 — HARDENED SECURITY · March 2026
+ * Version: 4.2.0 — HARDENED SECURITY · March 2026
  * ============================================================
  *
  * This is a sanitized version of the production transaction builder
@@ -88,6 +88,7 @@ import {
   TransactionInstruction,
   TransactionMessage,
   VersionedTransaction,
+  AccountInfo,
 } from "@solana/web3.js";
 import {
   createCloseAccountInstruction,
@@ -99,10 +100,11 @@ import {
 // ─── IMMUTABLE Constants (Object.freeze prevents runtime mutation) ──────────────
 
 /**
- * Protocol fee in basis points. 400 BPS = 4%.
+ * Protocol fee in basis points. 230 BPS = 2.3%.
+ * Competitive with Sol Incinerator (2.3% for rent recovery).
  * Industry standard: 10_000 BPS = 100%.
  */
-const PROTOCOL_FEE_BPS  = 400n;   // 4% — production value
+const PROTOCOL_FEE_BPS  = 230n;   // 2.3% — rent recovery
 const BPS_DIVISOR       = 10_000n;
 
 const CU_BUFFER_FACTOR      = 1.25;
@@ -138,7 +140,7 @@ const ALLOWED_RPC_HOSTS = Object.freeze([
   "g.alchemy.com",       // covers solana-mainnet.g.alchemy.com
   "mainnet.rpc.jito.wtf",
   "api.devnet.solana.com",
-  "127.0.0.1", "localhost",
+  ...(process.env.NODE_ENV !== "production" ? ["127.0.0.1", "localhost"] : []),
 ]);
 
 // ─── Public Types ────────────────────────────────────────────────────────────────
@@ -239,18 +241,42 @@ async function validateAccounts(
   accounts: TokenAccountToClose[],
   userPubkey: PublicKey
 ): Promise<{ valid: TokenAccountToClose[]; rejected: string[] }> {
-  const pubkeys = accounts.map((a) => a.pubkey);
-
-  // Batch fetch — single RPC call for all accounts
-  const infos = await connection.getMultipleAccountsInfo(pubkeys, "confirmed");
-
+  const validPubkeys: PublicKey[] = [];
+  const infosMap = new Map<string, AccountInfo<Buffer> | null>();
   const valid: TokenAccountToClose[] = [];
   const rejected: string[] = [];
 
+  for (const acc of accounts) {
+    try {
+      if (!acc.pubkey) throw new Error("Missing pubkey");
+      const pk = new PublicKey(acc.pubkey);
+      validPubkeys.push(pk);
+    } catch {
+      rejected.push(`[Invalid PK format]: ${String(acc.pubkey)}`);
+    }
+  }
+
+  // Batch fetch — chunked by 100 to respect Solana RPC limits
+  for (let i = 0; i < validPubkeys.length; i += 100) {
+    const chunk = validPubkeys.slice(i, i + 100);
+    const chunkInfos = await connection.getMultipleAccountsInfo(chunk, "confirmed");
+    for (let j = 0; j < chunk.length; j++) {
+      infosMap.set(chunk[j].toBase58(), chunkInfos[j]);
+    }
+  }
+
   for (let i = 0; i < accounts.length; i++) {
     const acc = accounts[i];
-    const info = infos[i];
-    const pk = acc.pubkey.toBase58();
+
+    let pkStr: string;
+    try {
+      pkStr = new PublicKey(acc.pubkey).toBase58();
+    } catch {
+      continue; // Already added to rejected array during the first loop
+    }
+
+    const info = infosMap.get(pkStr);
+    const pk = pkStr;
 
     if (!info) {
       rejected.push(`${pk}: does not exist on-chain`);
@@ -467,7 +493,7 @@ function buildBatchIxs(params: {
 
   // Protocol fee transfer — added after all close instructions
   if (batchRent > 0n) {
-    // FIX [HIGH-7]: BigInt arithmetic — 400n / 10_000n = 4% with no floating point error
+    // FIX [HIGH-7]: BigInt arithmetic — 230n / 10_000n = 2.3% with no floating point error
     const feeLamports = (batchRent * PROTOCOL_FEE_BPS) / BPS_DIVISOR;
     ixs.push(
       SystemProgram.transfer({

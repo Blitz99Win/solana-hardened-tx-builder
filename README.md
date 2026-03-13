@@ -125,7 +125,7 @@ JavaScript `Number.MAX_SAFE_INTEGER = 2^53-1`. Lamport totals can exceed this.
 
 **Fix:** Exclusive use of `BigInt` for all financial calculations:
 ```typescript
-const PROTOCOL_FEE_BPS = 400n;    // 4%
+const PROTOCOL_FEE_BPS = 230n;    // 2.3%
 const BPS_DIVISOR      = 10_000n;
 const feeLamports = (batchRent * PROTOCOL_FEE_BPS) / BPS_DIVISOR;
 ```
@@ -192,7 +192,7 @@ const ALLOWED_RPC_HOSTS = Object.freeze([
   "g.alchemy.com",
   "mainnet.rpc.jito.wtf",
   "api.devnet.solana.com",
-  "127.0.0.1", "localhost",
+  ...(process.env.NODE_ENV !== "production" ? ["127.0.0.1", "localhost"] : []),
 ]);
 ```
 
